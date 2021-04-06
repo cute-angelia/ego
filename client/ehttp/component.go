@@ -1,7 +1,6 @@
 package ehttp
 
 import (
-	"golang.org/x/net/publicsuffix"
 	"log"
 	"net"
 	"net/http"
@@ -9,14 +8,19 @@ import (
 	"time"
 
 	"github.com/go-resty/resty/v2"
+	"github.com/opentracing/opentracing-go"
+	"golang.org/x/net/publicsuffix"
 
 	"github.com/gotomicro/ego/core/eapp"
 	"github.com/gotomicro/ego/core/elog"
+	"github.com/gotomicro/ego/core/etrace"
 	"github.com/gotomicro/ego/core/util/xdebug"
 )
 
+// PackageName 设置包名
 const PackageName = "client.ehttp"
 
+// Component 组件
 type Component struct {
 	name   string
 	config *Config
@@ -44,9 +48,7 @@ func newComponent(name string, config *Config, logger *elog.Component) *Componen
 			}
 		}
 
-		var isSlowLog, isErrLog bool
 		var fields = make([]elog.Field, 0, 15)
-
 		fields = append(fields,
 			elog.FieldMethod(fullMethod),
 			elog.FieldName(name),
@@ -54,29 +56,31 @@ func newComponent(name string, config *Config, logger *elog.Component) *Componen
 			elog.FieldAddr(rr.URL.Host),
 		)
 
+		// 开启了链路，那么就记录链路id
+		if config.EnableTraceInterceptor && opentracing.IsGlobalTracerRegistered() {
+			fields = append(fields, elog.FieldTid(etrace.ExtractTraceID(request.Context())))
+		}
+
 		if config.EnableAccessInterceptorRes {
 			fields = append(fields, elog.FieldValueAny(respBody))
 		}
 
+		if config.SlowLogThreshold > time.Duration(0) && cost > config.SlowLogThreshold {
+			logger.Warn("slow", fields...)
+		}
+
 		if err != nil {
-			elog.FieldErr(err)
+			fields = append(fields, elog.FieldEvent("error"), elog.FieldErr(err))
 			if response == nil {
 				// 无 response 的是连接超时等系统级错误
-				fields = append(fields, elog.FieldEvent("error"))
 				logger.Error("access", fields...)
-			} else {
-				logger.Warn("access", fields...)
+				return
 			}
-			isErrLog = true
-		}
-
-		if config.SlowLogThreshold > time.Duration(0) && cost > config.SlowLogThreshold {
-			fields = append(fields, elog.FieldEvent("slow"))
 			logger.Warn("access", fields...)
-			isSlowLog = true
+			return
 		}
 
-		if config.EnableAccessInterceptor && !isSlowLog && !isErrLog {
+		if config.EnableAccessInterceptor {
 			fields = append(fields, elog.FieldEvent("normal"))
 			logger.Info("access", fields...)
 		}

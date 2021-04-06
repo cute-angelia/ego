@@ -3,25 +3,27 @@ package ego
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/signal"
+	"runtime"
+	"syscall"
+
+	"go.uber.org/automaxprocs/maxprocs"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/gotomicro/ego/core/constant"
 	"github.com/gotomicro/ego/core/eapp"
 	"github.com/gotomicro/ego/core/econf"
-	"github.com/gotomicro/ego/core/econf/file"
 	"github.com/gotomicro/ego/core/econf/manager"
 	"github.com/gotomicro/ego/core/eflag"
 	"github.com/gotomicro/ego/core/elog"
 	"github.com/gotomicro/ego/core/etrace"
 	"github.com/gotomicro/ego/core/etrace/ejaeger"
 	"github.com/gotomicro/ego/core/util/xcolor"
-	"github.com/gotomicro/ego/core/util/xgo"
-	"go.uber.org/automaxprocs/maxprocs"
-	"os"
-	"os/signal"
-	"runtime"
-	"syscall"
 )
 
 // waitSignals wait signal
-func (e *ego) waitSignals() {
+func (e *Ego) waitSignals() {
 	sig := make(chan os.Signal, 2)
 	signal.Notify(
 		sig,
@@ -33,24 +35,26 @@ func (e *ego) waitSignals() {
 		go func() {
 			stopCtx, cancel := context.WithTimeout(context.Background(), e.opts.stopTimeout)
 			defer cancel()
-			e.Stop(stopCtx, grace)
+			_ = e.Stop(stopCtx, grace)
 		}()
 		<-sig
 		os.Exit(128 + int(s.(syscall.Signal))) // second signal. Exit directly.
 	}()
 }
 
-func (e *ego) startServers() error {
+func (e *Ego) startServers() error {
 	// start multi servers
 	for _, s := range e.servers {
 		s := s
 		e.cycle.Run(func() (err error) {
-			s.Init()
+			_ = s.Init()
 			err = e.registerer.RegisterService(context.TODO(), s.Info())
 			if err != nil {
 				e.logger.Error("register service err", elog.FieldComponent(s.PackageName()), elog.FieldComponentName(s.Name()), elog.FieldErr(err))
 			}
-			defer e.registerer.UnregisterService(context.TODO(), s.Info())
+			defer func() {
+				_ = e.registerer.UnregisterService(context.TODO(), s.Info())
+			}()
 			e.logger.Info("start server", elog.FieldComponent(s.PackageName()), elog.FieldComponentName(s.Name()), elog.FieldAddr(s.Info().Label()))
 			defer e.logger.Info("stop server", elog.FieldComponent(s.PackageName()), elog.FieldComponentName(s.Name()), elog.FieldErr(err), elog.FieldAddr(s.Info().Label()))
 			err = s.Start()
@@ -60,7 +64,7 @@ func (e *ego) startServers() error {
 	return nil
 }
 
-func (e *ego) startCrons() error {
+func (e *Ego) startCrons() error {
 	for _, w := range e.crons {
 		w := w
 		e.cycle.Run(func() error {
@@ -71,7 +75,7 @@ func (e *ego) startCrons() error {
 }
 
 // todo handle error
-func (e *ego) startJobs() error {
+func (e *Ego) startJobs() error {
 	if len(e.jobs) == 0 {
 		return nil
 	}
@@ -83,18 +87,25 @@ func (e *ego) startJobs() error {
 			return runner.Start()
 		})
 	}
-	return xgo.ParallelWithError(jobs...)()
+
+	eg := errgroup.Group{}
+	for _, fn := range jobs {
+		eg.Go(fn)
+	}
+	return eg.Wait()
 }
 
 // parseFlags init
-func parseFlags() error {
-	eflag.Register(&eflag.StringFlag{
-		Name:    "config",
-		Usage:   "--config",
-		EnvVar:  "CONFIG",
-		Default: "",
-		Action:  func(name string, fs *eflag.FlagSet) {},
-	})
+func (e *Ego) parseFlags() error {
+	if !e.opts.disableFlagConfig {
+		eflag.Register(&eflag.StringFlag{
+			Name:    "config",
+			Usage:   "--config",
+			EnvVar:  constant.EgoConfigPath,
+			Default: constant.DefaultConfig,
+			Action:  func(name string, fs *eflag.FlagSet) {},
+		})
+	}
 
 	eflag.Register(&eflag.BoolFlag{
 		Name:    "watch",
@@ -116,7 +127,8 @@ func parseFlags() error {
 	eflag.Register(&eflag.StringFlag{
 		Name:    "host",
 		Usage:   "--host, print host",
-		Default: "",
+		EnvVar:  constant.EnvAppHost,
+		Default: "0.0.0.0",
 		Action:  func(string, *eflag.FlagSet) {},
 	})
 	return eflag.Parse()
@@ -125,34 +137,30 @@ func parseFlags() error {
 // loadConfig init
 func loadConfig() error {
 	var configAddr = eflag.String("config")
-	// 如果配置为空，那么赋值默认配置
-	if configAddr == "" {
-		configAddr = eapp.EgoConfigPath()
-	}
+	provider, parser, tag, err := manager.NewDataSource(configAddr, eflag.Bool("watch"))
 
-	// 暂时只支持文件
-	file.Register()
-	provider, err := manager.NewDataSource(file.DataSourceFile, configAddr, eflag.Bool("watch"))
-	if err != manager.ErrDefaultConfigNotExist {
-		if err != nil {
-			elog.EgoLogger.Panic("data source: provider error", elog.FieldComponent(econf.PackageName), elog.FieldErr(err))
-		}
-
-		parser, tag := file.ExtParser(configAddr)
-		// 如果不是，就要加载文件，加载不到panic
-		if err := econf.LoadFromDataSource(provider, parser, econf.TagName(tag)); err != nil {
-			elog.EgoLogger.Panic("data source: load config", elog.FieldComponent(econf.PackageName), elog.FieldErrKind("unmarshal config err"), elog.FieldErr(err))
-		}
-		elog.EgoLogger.Info("init config", elog.FieldComponent(econf.PackageName), elog.String("addr", configAddr))
+	// 如果不存在配置，找不到该文件路径，该错误只存在file类型
+	if err == manager.ErrDefaultConfigNotExist {
 		// 如果协议是file类型，并且是默认文件配置，那么判断下文件是否存在，如果不存在只告诉warning，什么都不做
-	} else {
 		elog.EgoLogger.Warn("no config... ", elog.FieldComponent(econf.PackageName), elog.String("addr", configAddr), elog.FieldErr(err))
+		return nil
 	}
+
+	// 如果存在错误，报错
+	if err != nil {
+		elog.EgoLogger.Panic("data source: provider error", elog.FieldComponent(econf.PackageName), elog.FieldErr(err))
+	}
+
+	// 如果不是，就要加载文件，加载不到panic
+	if err := econf.LoadFromDataSource(provider, parser, econf.WithTagName(tag)); err != nil {
+		elog.EgoLogger.Panic("data source: load config", elog.FieldComponent(econf.PackageName), elog.FieldErrKind("unmarshal config err"), elog.FieldErr(err))
+	}
+	elog.EgoLogger.Info("init config", elog.FieldComponent(econf.PackageName), elog.String("addr", configAddr))
 	return nil
 }
 
-// initLogger init application and ego logger
-func (e *ego) initLogger() error {
+// initLogger init application and Ego logger
+func (e *Ego) initLogger() error {
 	if econf.Get(e.opts.configPrefix+"logger.default") != nil {
 		elog.DefaultLogger = elog.Load(e.opts.configPrefix + "logger.default").Build()
 		elog.EgoLogger.Info("reinit default logger", elog.FieldComponent(elog.PackageName))
@@ -166,7 +174,7 @@ func (e *ego) initLogger() error {
 }
 
 // initTracer init global tracer
-func (e *ego) initTracer() error {
+func (e *Ego) initTracer() error {
 	if econf.Get(e.opts.configPrefix+"trace.jaeger") != nil {
 		container := ejaeger.Load(e.opts.configPrefix + "trace.jaeger")
 		tracer := container.Build()
@@ -181,7 +189,7 @@ func (e *ego) initTracer() error {
 
 // initMaxProcs init
 func initMaxProcs() error {
-	if maxProcs := econf.GetInt("ego.maxProc"); maxProcs != 0 {
+	if maxProcs := econf.GetInt("Ego.maxProc"); maxProcs != 0 {
 		runtime.GOMAXPROCS(maxProcs)
 	} else {
 		if _, err := maxprocs.Set(); err != nil {
@@ -194,12 +202,12 @@ func initMaxProcs() error {
 
 func printLogger() error {
 	elog.EgoLogger.Info("init default logger", elog.FieldComponent(elog.PackageName))
-	elog.EgoLogger.Info("init ego logger", elog.FieldComponent(elog.PackageName))
+	elog.EgoLogger.Info("init Ego logger", elog.FieldComponent(elog.PackageName))
 	return nil
 }
 
 // printBanner init
-func (e *ego) printBanner() error {
+func (e *Ego) printBanner() error {
 	if e.opts.disableBanner {
 		return nil
 	}

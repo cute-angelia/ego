@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"net"
+	"net/http"
+	"net/http/cookiejar"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,6 +16,7 @@ import (
 	"github.com/golang/protobuf/proto"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	"golang.org/x/net/publicsuffix"
 
 	"github.com/gotomicro/ego/core/eapp"
 	"github.com/gotomicro/ego/core/elog/ali/pb"
@@ -29,28 +33,30 @@ const (
 	apiBulkMinSize = 256
 )
 
+// LogContent ...
 type LogContent = pb.Log_Content
 
 // config is the config for Ali Log
 type config struct {
-	encoder             zapcore.Encoder
-	project             string
-	endpoint            string
-	accessKeyID         string
-	accessKeySecret     string
-	logstore            string
-	topics              []string
-	source              string
-	flushSize           int
-	flushBufferSize     int32
-	flushBufferInterval time.Duration
-	levelEnabler        zapcore.LevelEnabler
-	apiBulkSize         int
-	apiTimeout          time.Duration
-	apiRetryCount       int
-	apiRetryWaitTime    time.Duration
-	apiRetryMaxWaitTime time.Duration
-	fallbackCore        zapcore.Core
+	encoder         zapcore.Encoder
+	project         string
+	endpoint        string
+	accessKeyID     string
+	accessKeySecret string
+	logstore        string
+	//flushSize              int
+	flushBufferSize        int32
+	flushBufferInterval    time.Duration
+	levelEnabler           zapcore.LevelEnabler
+	apiBulkSize            int
+	apiTimeout             time.Duration
+	apiRetryCount          int
+	apiRetryWaitTime       time.Duration
+	apiRetryMaxWaitTime    time.Duration
+	apiMaxIdleConns        int
+	apiIdleConnTimeout     time.Duration
+	apiMaxIdleConnsPerHost int
+	fallbackCore           zapcore.Core
 }
 
 // writer implements LoggerInterface.
@@ -90,7 +96,11 @@ func newWriter(c config) (*writer, error) {
 		accessKeySecret: w.accessKeySecret,
 	}
 	p.initHost()
-	p.cli = resty.New().
+	cookieJar, _ := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
+	p.cli = resty.NewWithClient(&http.Client{
+		Transport: createTransport(c),
+		Jar:       cookieJar,
+	}).
 		SetDebug(eapp.IsDevelopmentMode()).
 		SetHostURL(p.host).
 		SetTimeout(c.apiTimeout).
@@ -107,6 +117,27 @@ func newWriter(c config) (*writer, error) {
 	w.sync()
 	w.observe()
 	return w, nil
+}
+
+func createTransport(c config) *http.Transport {
+	dialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+		DualStack: true,
+	}
+	if c.apiMaxIdleConnsPerHost == 0 {
+		c.apiMaxIdleConnsPerHost = c.apiMaxIdleConns
+	}
+	return &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           dialer.DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          c.apiMaxIdleConns,
+		IdleConnTimeout:       c.apiIdleConnTimeout,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		MaxIdleConnsPerHost:   c.apiMaxIdleConnsPerHost,
+	}
 }
 
 func genLog(fields map[string]interface{}) *pb.Log {
@@ -130,6 +161,7 @@ func (w *writer) write(fields map[string]interface{}) (err error) {
 	atomic.AddInt32(w.curBufSize, int32(l.XXX_Size()))
 	if atomic.LoadInt32(w.curBufSize) >= w.flushBufferSize || len(w.ch) >= cap(w.ch) {
 		err = w.flush()
+		atomic.StoreInt32(w.curBufSize, 0)
 	}
 	return
 }
@@ -171,7 +203,7 @@ func (w *writer) flush() error {
 
 func (w *writer) writeToFallbackLogger(lg pb.LogGroup) {
 	for _, v := range lg.Logs {
-		fields := make([]zapcore.Field, len(v.Contents), len(v.Contents))
+		fields := make([]zapcore.Field, len(v.Contents))
 		for i, val := range v.Contents {
 			fields[i] = zap.String(val.GetKey(), val.GetValue())
 		}
@@ -198,7 +230,6 @@ func (w *writer) sync() {
 			}
 		}
 	}()
-	return
 }
 
 func (w *writer) observe() {

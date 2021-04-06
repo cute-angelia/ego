@@ -3,9 +3,6 @@ package egin
 import (
 	"bytes"
 	"fmt"
-	"github.com/gotomicro/ego/core/eapp"
-	"github.com/opentracing/opentracing-go"
-	"github.com/uber/jaeger-client-go"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -15,11 +12,14 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/opentracing/opentracing-go"
+	"github.com/uber/jaeger-client-go"
+	"go.uber.org/zap"
 
+	"github.com/gotomicro/ego/core/eapp"
 	"github.com/gotomicro/ego/core/elog"
 	"github.com/gotomicro/ego/core/emetric"
 	"github.com/gotomicro/ego/core/etrace"
-	"go.uber.org/zap"
 )
 
 var (
@@ -38,28 +38,30 @@ func extractAPP(ctx *gin.Context) string {
 func recoverMiddleware(logger *elog.Component, config *Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var beg = time.Now()
-		var fields = make([]elog.Field, 0, 8)
+		// 为了性能考虑，如果要加日志字段，需要改变slice大小
+		var fields = make([]elog.Field, 0, 15)
 		var brokenPipe bool
 		var event = "normal"
 		defer func() {
 			cost := time.Since(beg)
 
-			// slow log
-			if config.SlowLogThreshold > time.Duration(0) && config.SlowLogThreshold < cost {
-				event = "slow"
-			}
-
 			fields = append(fields,
 				elog.FieldCost(cost),
 				elog.FieldType(c.Request.Method), // GET, POST
-				elog.FieldMethod(c.Request.URL.Path),
-				elog.FieldIp(c.ClientIP()),
+				elog.FieldMethod(c.FullPath()),
+				elog.FieldAddr(c.Request.URL.Path),
+				elog.FieldIP(c.ClientIP()),
 				elog.FieldSize(int32(c.Writer.Size())),
 				elog.FieldPeerIP(getPeerIP(c.Request.RemoteAddr)),
 			)
 
 			if config.EnableTraceInterceptor && opentracing.IsGlobalTracerRegistered() {
 				fields = append(fields, elog.FieldTid(etrace.ExtractTraceID(c.Request.Context())))
+			}
+
+			// slow log
+			if config.SlowLogThreshold > time.Duration(0) && config.SlowLogThreshold < cost {
+				logger.Warn("slow", fields...)
 			}
 
 			if rec := recover(); rec != nil {
@@ -80,11 +82,11 @@ func recoverMiddleware(logger *elog.Component, config *Config) gin.HandlerFunc {
 				}
 
 				event = "recover"
-				stack := stack(3)
+				stackInfo := stack(3)
 
 				fields = append(fields,
 					elog.FieldEvent(event),
-					zap.ByteString("stack", stack),
+					zap.ByteString("stack", stackInfo),
 					elog.FieldErrAny(rec),
 					elog.FieldCode(int32(c.Writer.Status())),
 				)
@@ -97,12 +99,7 @@ func recoverMiddleware(logger *elog.Component, config *Config) gin.HandlerFunc {
 				elog.FieldErrAny(c.Errors.ByType(gin.ErrorTypePrivate).String()),
 				elog.FieldCode(int32(c.Writer.Status())),
 			)
-
-			if event == "slow" {
-				logger.Warn("access", fields...)
-			} else {
-				logger.Info("access", fields...)
-			}
+			logger.Info("access", fields...)
 		}()
 		c.Next()
 	}
@@ -173,9 +170,8 @@ func metricServerInterceptor() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		beg := time.Now()
 		c.Next()
-		emetric.ServerHandleHistogram.Observe(time.Since(beg).Seconds(), emetric.TypeHTTP, c.Request.Method+"."+c.Request.URL.Path, extractAPP(c))
-		emetric.ServerHandleCounter.Inc(emetric.TypeHTTP, c.Request.Method+"."+c.Request.URL.Path, extractAPP(c), http.StatusText(c.Writer.Status()))
-		return
+		emetric.ServerHandleHistogram.Observe(time.Since(beg).Seconds(), emetric.TypeHTTP, c.Request.Method+"."+c.FullPath(), extractAPP(c))
+		emetric.ServerHandleCounter.Inc(emetric.TypeHTTP, c.Request.Method+"."+c.FullPath(), extractAPP(c), http.StatusText(c.Writer.Status()))
 	}
 }
 
@@ -183,7 +179,7 @@ func traceServerInterceptor() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		span, ctx := etrace.StartSpanFromContext(
 			c.Request.Context(),
-			c.Request.Method+" "+c.Request.URL.Path,
+			c.Request.Method+"."+c.FullPath(),
 			etrace.TagComponent("http"),
 			etrace.TagSpanKind("server"),
 			etrace.HeaderExtractor(c.Request.Header),

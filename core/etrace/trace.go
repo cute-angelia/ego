@@ -2,6 +2,7 @@ package etrace
 
 import (
 	"context"
+
 	"github.com/uber/jaeger-client-go"
 
 	"github.com/opentracing/opentracing-go"
@@ -17,11 +18,11 @@ var (
 
 // SetGlobalTracer ...
 func SetGlobalTracer(tracer opentracing.Tracer) {
-	elog.Info("set global tracer", elog.FieldComponent("trace"))
+	elog.EgoLogger.Info("set global tracer", elog.FieldComponent("trace"))
 	opentracing.SetGlobalTracer(tracer)
 }
 
-// Start ...
+// StartSpanFromContext ...
 func StartSpanFromContext(ctx context.Context, op string, opts ...opentracing.StartSpanOption) (opentracing.Span, context.Context) {
 	return opentracing.StartSpanFromContext(ctx, op, opts...)
 }
@@ -33,6 +34,10 @@ func SpanFromContext(ctx context.Context) opentracing.Span {
 
 // ExtractTraceID HTTP使用request.Context，不要使用错了
 func ExtractTraceID(ctx context.Context) string {
+	if !opentracing.IsGlobalTracerRegistered() {
+		return ""
+	}
+
 	span := opentracing.SpanFromContext(ctx)
 	if span == nil {
 		return ""

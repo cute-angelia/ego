@@ -27,7 +27,7 @@ func WithBalancerName(balancerName string) Option {
 	}
 }
 
-// WithAddr setting grpc dial timeout
+// WithDialTimeout setting grpc dial timeout
 func WithDialTimeout(t time.Duration) Option {
 	return func(c *Container) {
 		c.config.DialTimeout = t
@@ -55,5 +55,26 @@ func WithDialOption(opts ...grpc.DialOption) Option {
 			c.config.dialOptions = make([]grpc.DialOption, 0)
 		}
 		c.config.dialOptions = append(c.config.dialOptions, opts...)
+	}
+}
+
+// WithEnableAccessInterceptor 开启日志记录
+func WithEnableAccessInterceptor(enableAccessInterceptor bool) Option {
+	return func(c *Container) {
+		c.config.EnableAccessInterceptor = enableAccessInterceptor
+	}
+}
+
+// WithEnableAccessInterceptorReq 开启日志请求参数
+func WithEnableAccessInterceptorReq(enableAccessInterceptorReq bool) Option {
+	return func(c *Container) {
+		c.config.EnableAccessInterceptorReq = enableAccessInterceptorReq
+	}
+}
+
+// WithEnableAccessInterceptorRes 开启日志响应记录
+func WithEnableAccessInterceptorRes(enableAccessInterceptorRes bool) Option {
+	return func(c *Container) {
+		c.config.EnableAccessInterceptorRes = enableAccessInterceptorRes
 	}
 }

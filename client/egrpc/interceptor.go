@@ -7,6 +7,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/opentracing/opentracing-go"
 	"github.com/opentracing/opentracing-go/ext"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -45,27 +46,27 @@ func metricUnaryClientInterceptor(name string) func(ctx context.Context, method 
 }
 
 // metricStreamClientInterceptor returns grpc stream request metrics collector interceptor
-func metricStreamClientInterceptor(name string) func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
-	return func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
-		beg := time.Now()
-		clientStream, err := streamer(ctx, desc, cc, method, opts...)
-
-		// 暂时用默认的grpc的默认err收敛
-		codes := ecode.ExtractCodes(err)
-		emetric.ClientHandleCounter.Inc(emetric.TypeGRPCStream, name, method, cc.Target(), codes.GetMessage())
-		emetric.ClientHandleHistogram.Observe(time.Since(beg).Seconds(), emetric.TypeGRPCStream, name, method, cc.Target())
-		return clientStream, err
-	}
-}
+//func metricStreamClientInterceptor(name string) func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+//	return func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+//		beg := time.Now()
+//		clientStream, err := streamer(ctx, desc, cc, method, opts...)
+//
+//		// 暂时用默认的grpc的默认err收敛
+//		codes := ecode.ExtractCodes(err)
+//		emetric.ClientHandleCounter.Inc(emetric.TypeGRPCStream, name, method, cc.Target(), codes.GetMessage())
+//		emetric.ClientHandleHistogram.Observe(time.Since(beg).Seconds(), emetric.TypeGRPCStream, name, method, cc.Target())
+//		return clientStream, err
+//	}
+//}
 
 // debugUnaryClientInterceptor returns grpc unary request request and response details interceptor
 func debugUnaryClientInterceptor(logger *elog.Component, compName, addr string) grpc.UnaryClientInterceptor {
 	return func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 		var p peer.Peer
-		prefix := fmt.Sprintf("[%s]", addr)
-		if remote, ok := peer.FromContext(ctx); ok && remote.Addr != nil {
-			prefix = prefix + "(" + remote.Addr.String() + ")"
-		}
+		//prefix := fmt.Sprintf("[%s]", addr)
+		//if remote, ok := peer.FromContext(ctx); ok && remote.Addr != nil {
+		//	prefix = prefix + "(" + remote.Addr.String() + ")"
+		//}
 
 		beg := time.Now()
 		err := invoker(ctx, method, req, reply, cc, append(opts, grpc.Peer(&p))...)
@@ -76,9 +77,8 @@ func debugUnaryClientInterceptor(logger *elog.Component, compName, addr string) 
 			} else {
 				log.Println("grpc.response", xdebug.MakeReqResInfo(compName, addr, cost, method+" | "+fmt.Sprintf("%v", req), reply))
 			}
-		} else {
-			// todo log
 		}
+		// todo log
 
 		return err
 	}
@@ -152,8 +152,6 @@ func loggerUnaryClientInterceptor(_logger *elog.Component, config *Config) grpc.
 		beg := time.Now()
 		err := invoker(ctx, method, req, res, cc, opts...)
 		cost := time.Since(beg)
-		isErrLog := false
-		isSlowLog := false
 		spbStatus := ecode.ExtractCodes(err)
 		var fields = make([]elog.Field, 0, 15)
 		fields = append(fields,
@@ -165,34 +163,36 @@ func loggerUnaryClientInterceptor(_logger *elog.Component, config *Config) grpc.
 			elog.FieldName(cc.Target()),
 		)
 
-		if config.EnableAccessInterceptorReq {
-			fields = append(fields, elog.Any("req", json.RawMessage(xstring.Json(req))))
-		}
-		if config.EnableAccessInterceptorRes {
-			fields = append(fields, elog.Any("res", json.RawMessage(xstring.Json(res))))
+		// 开启了链路，那么就记录链路id
+		if config.EnableTraceInterceptor && opentracing.IsGlobalTracerRegistered() {
+			fields = append(fields, elog.FieldTid(etrace.ExtractTraceID(ctx)))
 		}
 
-		if err != nil {
-			// 只记录系统级别错误
-			if spbStatus.Code < ecode.EcodeNum {
-				fields = append(fields, elog.FieldEvent("error"))
-				// 只记录系统级别错误
-				_logger.Error("access", fields...)
-			} else {
-				// 业务报错只做warning
-				_logger.Warn("access", fields...)
-			}
-			isErrLog = true
-			return err
+		if config.EnableAccessInterceptorReq {
+			fields = append(fields, elog.Any("req", json.RawMessage(xstring.JSON(req))))
+		}
+		if config.EnableAccessInterceptorRes {
+			fields = append(fields, elog.Any("res", json.RawMessage(xstring.JSON(res))))
 		}
 
 		if config.SlowLogThreshold > time.Duration(0) && cost > config.SlowLogThreshold {
-			fields = append(fields, elog.FieldEvent("slow"))
-			isSlowLog = true
-			_logger.Warn("access", fields...)
+			_logger.Warn("slow", fields...)
 		}
 
-		if config.EnableAccessInterceptor && !isErrLog && !isSlowLog {
+		if err != nil {
+			fields = append(fields, elog.FieldEvent("error"), elog.FieldErr(err))
+			// 只记录系统级别错误
+			if spbStatus.Code < ecode.EcodeNum {
+				// 只记录系统级别错误
+				_logger.Error("access", fields...)
+				return err
+			}
+			// 业务报错只做warning
+			_logger.Warn("access", fields...)
+			return err
+		}
+
+		if config.EnableAccessInterceptor {
 			fields = append(fields, elog.FieldEvent("normal"))
 			_logger.Info("access", fields...)
 		}

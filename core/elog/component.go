@@ -35,9 +35,13 @@ const (
 )
 
 type (
-	Func      func(string, ...zap.Field)
-	Field     = zap.Field
-	Level     = zapcore.Level
+	// Func ...
+	Func func(string, ...zap.Field)
+	// Field ...
+	Field = zap.Field
+	// Level ...
+	Level = zapcore.Level
+	// Component 组件
 	Component struct {
 		name          string
 		desugar       *zap.Logger
@@ -81,7 +85,19 @@ const (
 	defaultAliFallbackCorePath = "ali.log"
 )
 
-// newRotateFileCore construct  a rotate file zapcore.Core
+// newStderrCore constructs a zapcore.Core with stderr syncer
+func newStderrCore(config *Config, lv zap.AtomicLevel) (zapcore.Core, CloseFunc) {
+	// Debug output to console and file by default
+	cf := noopCloseFunc
+	var ws = zapcore.AddSync(os.Stderr)
+	if config.EnableAsync {
+		ws, cf = Buffer(ws, config.FlushBufferSize, config.FlushBufferInterval)
+	}
+	core := zapcore.NewCore(zapcore.NewJSONEncoder(*config.encoderConfig), ws, lv)
+	return core, cf
+}
+
+// newRotateFileCore constructs a zapcore.Core with rotate file syncer
 func newRotateFileCore(config *Config, lv zap.AtomicLevel) (zapcore.Core, CloseFunc) {
 	// Debug output to console and file by default
 	cf := noopCloseFunc
@@ -120,11 +136,14 @@ func newAliCore(config *Config, lv zap.AtomicLevel) (zapcore.Core, CloseFunc) {
 		ali.WithLevelEnabler(lv),
 		ali.WithFlushBufferSize(config.FlushBufferSize),
 		ali.WithFlushBufferInterval(config.FlushBufferInterval),
-		ali.WithApiBulkSize(config.AliApiBulkSize),
-		ali.WithApiTimeout(config.AliApiTimeout),
-		ali.WithApiRetryCount(config.AliApiRetryCount),
-		ali.WithApiRetryWaitTime(config.AliApiRetryWaitTime),
-		ali.WithApiRetryMaxWaitTime(config.AliApiRetryMaxWaitTime),
+		ali.WithAPIBulkSize(config.AliAPIBulkSize),
+		ali.WithAPITimeout(config.AliAPITimeout),
+		ali.WithAPIRetryCount(config.AliAPIRetryCount),
+		ali.WithAPIRetryWaitTime(config.AliAPIRetryWaitTime),
+		ali.WithAPIRetryMaxWaitTime(config.AliAPIRetryMaxWaitTime),
+		ali.WithAPIMaxIdleConns(config.AliAPIMaxIdleConns),
+		ali.WithAPIIdleConnTimeout(config.AliAPIIdleConnTimeout),
+		ali.WithAPIMaxIdleConnsPerHost(config.AliAPIMaxIdleConnsPerHost),
 		ali.WithFallbackCore(fallbackCore),
 	)
 	return core, func() (err error) {
@@ -139,13 +158,16 @@ func newAliCore(config *Config, lv zap.AtomicLevel) (zapcore.Core, CloseFunc) {
 }
 
 func newCore(config *Config, lv zap.AtomicLevel) (zapcore.Core, CloseFunc) {
-	if config.Writer == writerRotateFile {
+	switch config.Writer {
+	case writerRotateFile:
 		return newRotateFileCore(config, lv)
-	}
-	if config.Writer == writerAliSLS {
+	case writerAliSLS:
 		return newAliCore(config, lv)
+	case writerStderr:
+		return newStderrCore(config, lv)
+	default:
+		panic("unsupported writer")
 	}
-	return nil, nil
 }
 
 func newLogger(name string, config *Config) *Component {
@@ -180,7 +202,7 @@ func (logger *Component) AutoLevel(confKey string) {
 		lvText := strings.ToLower(config.GetString(confKey))
 		if lvText != "" {
 			logger.Info("update level", String("level", lvText), String("name", logger.config.Name))
-			logger.lv.UnmarshalText([]byte(lvText))
+			_ = logger.lv.UnmarshalText([]byte(lvText))
 		}
 	})
 }
@@ -204,12 +226,11 @@ func (logger *Component) Flush() error {
 		}
 	}
 
-	logger.desugar.Sync()
+	_ = logger.desugar.Sync()
 	return nil
 }
 
-// DefaultZapConfig ...
-func DefaultZapConfig() *zapcore.EncoderConfig {
+func defaultZapConfig() *zapcore.EncoderConfig {
 	return &zapcore.EncoderConfig{
 		TimeKey:        "ts",
 		LevelKey:       "lv",
@@ -225,7 +246,7 @@ func DefaultZapConfig() *zapcore.EncoderConfig {
 	}
 }
 
-func DefaultDebugConfig() *zapcore.EncoderConfig {
+func defaultDebugConfig() *zapcore.EncoderConfig {
 	return &zapcore.EncoderConfig{
 		TimeKey:        "ts",
 		LevelKey:       "lv",
@@ -422,7 +443,7 @@ func (logger *Component) DPanicf(template string, args ...interface{}) {
 func (logger *Component) Fatal(msg string, fields ...Field) {
 	if logger.IsDebugMode() {
 		panicDetail(msg, fields...)
-		msg = normalizeMessage(msg)
+		//msg = normalizeMessage(msg)
 		return
 	}
 	logger.desugar.Fatal(msg, fields...)
